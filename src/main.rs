@@ -1,4 +1,5 @@
 use image::EncodableLayout;
+use std::env;
 use ndarray::{Array2, ArrayBase, CowArray, CowRepr, Dim, IxDynImpl};
 use ort::Environment;
 use ort::{session::Session, GraphOptimizationLevel, SessionBuilder, Value};
@@ -76,15 +77,28 @@ async fn main() {
         pad_token: "[PAD]".to_string(),
     }));
     tokenizer.with_truncation(Some(tokenizers::TruncationParams {
-        direction: tokenizers::TruncationDirection::Right,
-        max_length: 77,
-        strategy: tokenizers::TruncationStrategy::LongestFirst,
-        stride: 0,
-    })).unwrap();
+            direction: tokenizers::TruncationDirection::Right,
+            max_length: 77,
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            stride: 0,
+        }))
+    .unwrap();
 
+    let owners: Vec<u64> = env::var("CLOSET_OWNERS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    log::info!("Owners: {:?}", owners);
     let handler = Update::filter_message()
-        .branch(Message::filter_photo().endpoint(photo_upload))
-        .endpoint(photo_find);
+        .branch(
+            dptree::filter(move |msg: Message| {
+                let from = msg.from.unwrap().id.0;
+                owners.contains(&from)
+            })
+            .branch(Message::filter_photo().endpoint(photo_upload))
+            .endpoint(photo_find)
+        );
 
     let models = Models {
         image: image_model,
@@ -134,8 +148,8 @@ async fn photo_upload(
 
     match db
         .execute(
-            "INSERT INTO photos (msg_id, file_id, embeddings) VALUES (?1, ?2, vector32(?3))",
-            libsql::params![msg.id.0, file.id.clone(), embeddings.as_bytes()],
+            "INSERT INTO photos (file_id, embeddings) VALUES (?1, vector32(?2))",
+            libsql::params![file.id.clone(), embeddings.as_bytes()],
         )
         .await
     {
@@ -188,7 +202,7 @@ async fn photo_find(
         match row.get::<String>(0) {
             Ok(id) => file_ids.push(InputMedia::Photo(InputMediaPhoto::new(InputFile::file_id(
                 id,
-            )))),
+            )).show_caption_above_media(true))),
             Err(e) => {
                 log::error!("Failed to get field file_id because: {}", e);
                 continue;
@@ -198,7 +212,6 @@ async fn photo_find(
 
     if let Some(InputMedia::Photo(p)) = file_ids.first_mut() {
         p.caption = Some("How about these?".to_owned());
-        p.show_caption_above_media = true;
     } else {
         bot.send_message(msg.chat.id, "Did not find matching clothes")
             .reply_to(msg)
