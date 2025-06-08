@@ -1,0 +1,6 @@
+/target
+*.db
+data
+models/.venv
+models/*.pt
+*.onnx

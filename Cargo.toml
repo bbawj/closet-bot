@@ -1,0 +1,16 @@
+[package]
+name = "closet-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+teloxide = { version = "0.15.0", features = ["macros"] }
+log = "0.4"
+pretty_env_logger = "0.5"
+tokio = { version =  "1.8", features = ["rt-multi-thread", "macros"] }
+ort = "1.16.3"
+image = "0.25.6"
+ndarray = "0.15.6"
+itertools = "0.14.0"
+libsql = "0.9.9"
+tokenizers = { version = "0.21.1" }
