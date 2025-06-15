@@ -14,3 +14,4 @@ ndarray = "0.15.6"
 itertools = "0.14.0"
 libsql = "0.9.9"
 tokenizers = { version = "0.21.1" }
+imageproc = "0.25.0"

@@ -1,8 +1,11 @@
 use image::EncodableLayout;
-use std::env;
+use image_processor::preprocess;
+use itertools::Itertools;
+use libsql::Builder;
 use ndarray::{Array2, ArrayBase, CowArray, CowRepr, Dim, IxDynImpl};
 use ort::Environment;
 use ort::{session::Session, GraphOptimizationLevel, SessionBuilder, Value};
+use std::env;
 use std::error::Error;
 use std::sync::Arc;
 use teloxide::net::Download;
@@ -11,10 +14,9 @@ use teloxide::sugar::request::RequestReplyExt;
 use teloxide::types::{InputFile, InputMedia, InputMediaPhoto, PhotoSize};
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::Encoding;
-pub mod clip_image_processor;
-use crate::clip_image_processor::CLIPImageProcessor;
-use itertools::Itertools;
-use libsql::Builder;
+use tokio::fs;
+
+pub mod image_processor;
 
 pub type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -22,6 +24,7 @@ pub type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 pub struct Models {
     image: Arc<Session>,
     text: Arc<Session>,
+    det: Arc<Session>,
 }
 
 #[tokio::main]
@@ -30,9 +33,18 @@ async fn main() {
 
     let bot = Bot::from_env();
 
-    let db = Builder::new_local("data.db").build().await.unwrap();
+    fs::create_dir_all("data")
+        .await
+        .expect("Could not create data dir");
+    let db = Builder::new_local("data/data.db").build().await.unwrap();
     let db_conn = db.connect().unwrap();
-    db_conn.execute("CREATE TABLE IF NOT EXISTS photos (msg_id INT PRIMARY KEY, file_id varchar(255), embeddings F32_BLOB(512))", ()).await.unwrap();
+    db_conn
+        .execute(
+            "CREATE TABLE IF NOT EXISTS photos (file_id varchar(255), embeddings F32_BLOB(512))",
+            (),
+        )
+        .await
+        .unwrap();
     db_conn
         .execute(
             "CREATE INDEX IF NOT EXISTS photos_vector_idx ON photos(libsql_vector_idx(embeddings))",
@@ -42,6 +54,19 @@ async fn main() {
         .unwrap();
 
     let env = Environment::builder().build().unwrap().into_arc();
+    let det_model = Arc::new(
+        SessionBuilder::new(&env)
+            .unwrap()
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .unwrap()
+            .with_intra_threads(4)
+            .unwrap()
+            .with_model_from_file("yolo11n.onnx")
+            .unwrap(),
+    );
+    log::info!("Detection Model loaded successfully!");
+    log::info!("Inputs: {:?}", det_model.inputs);
+    log::info!("Outputs: {:?}", det_model.outputs);
     let image_model = Arc::new(
         SessionBuilder::new(&env)
             .unwrap()
@@ -54,6 +79,7 @@ async fn main() {
     );
     log::info!("Image Model loaded successfully!");
     log::info!("Inputs: {:?}", image_model.inputs);
+    log::info!("Outputs: {:?}", image_model.outputs);
     let text_model = Arc::new(
         SessionBuilder::new(&env)
             .unwrap()
@@ -66,6 +92,7 @@ async fn main() {
     );
     log::info!("Text Model loaded successfully!");
     log::info!("Inputs: {:?}", text_model.inputs);
+    log::info!("Outputs: {:?}", text_model.outputs);
 
     let mut tokenizer = Tokenizer::from_file("tokenizer.json").unwrap();
     tokenizer.with_padding(Some(tokenizers::PaddingParams {
@@ -76,13 +103,14 @@ async fn main() {
         pad_type_id: 0,
         pad_token: "[PAD]".to_string(),
     }));
-    tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
             direction: tokenizers::TruncationDirection::Right,
             max_length: 77,
             strategy: tokenizers::TruncationStrategy::LongestFirst,
             stride: 0,
         }))
-    .unwrap();
+        .unwrap();
 
     let owners: Vec<u64> = env::var("CLOSET_OWNERS")
         .unwrap_or_default()
@@ -90,19 +118,19 @@ async fn main() {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
     log::info!("Owners: {:?}", owners);
-    let handler = Update::filter_message()
-        .branch(
-            dptree::filter(move |msg: Message| {
-                let from = msg.from.unwrap().id.0;
-                owners.contains(&from)
-            })
-            .branch(Message::filter_photo().endpoint(photo_upload))
-            .endpoint(photo_find)
-        );
+    let handler = Update::filter_message().branch(
+        dptree::filter(move |msg: Message| {
+            let from = msg.from.unwrap().id.0;
+            owners.contains(&from)
+        })
+        .branch(Message::filter_photo().endpoint(photo_upload))
+        .endpoint(photo_find),
+    );
 
     let models = Models {
         image: image_model,
         text: text_model,
+        det: det_model,
     };
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![models, db_conn, tokenizer])
@@ -127,18 +155,22 @@ async fn photo_upload(
     msg: Message,
     photos: Vec<PhotoSize>,
 ) -> HandlerResult {
-    use tokio::fs;
-
     let chat_id = msg.chat.id;
 
-    let photo = &photos[0];
+    let photo = match photos.last() {
+        Some(p) => p,
+        None => return Err("No photos in message".into()),
+    };
     let file = bot.get_file(&photo.file.id).await?;
-    fs::create_dir_all("data").await?;
     let path = format!("data/{}", &file.id);
     let mut dst = fs::File::create(&path).await?;
     bot.download_file(&file.path, &mut dst).await?;
 
-    let embeddings = match encode(models.image.clone(), fs::read(&path).await?) {
+    let embeddings = match encode(
+        models.image.clone(),
+        models.det.clone(),
+        fs::read(&path).await?,
+    ) {
         Ok(embeddings) => embeddings,
         Err(e) => {
             log::error!("Failed to get embeddings");
@@ -182,12 +214,16 @@ async fn photo_find(
         }
     };
 
+    let top = 3;
     let mut similar = match db
         .query(
-            "SELECT file_id
-             FROM vector_top_k('photos_vector_idx', vector32(?1), 3)
-             JOIN photos ON photos.rowid = id",
-            libsql::params!(embedding.as_bytes()),
+            "SELECT p.file_id, vector_distance_cos(p.embeddings, vector32(?1)) AS distance, vector_extract(p.embeddings)
+             FROM vector_top_k('photos_vector_idx', vector32(?1), ?2) AS i
+             JOIN photos p ON p.rowid = i.id
+             WHERE distance > 0.5
+             ORDER BY distance ASC
+             LIMIT ?2",
+            libsql::params!(embedding.as_bytes(), top),
         )
         .await
     {
@@ -199,10 +235,16 @@ async fn photo_find(
 
     let mut file_ids: Vec<InputMedia> = Vec::new();
     while let Some(row) = similar.next().await.unwrap_or(None) {
+        log::info!(
+            "File: {:?} matched with similarity: {:?}, embedding: {:?}",
+            row.get::<String>(0),
+            row.get::<f64>(1),
+            row.get::<String>(2),
+        );
         match row.get::<String>(0) {
-            Ok(id) => file_ids.push(InputMedia::Photo(InputMediaPhoto::new(InputFile::file_id(
-                id,
-            )).show_caption_above_media(true))),
+            Ok(id) => file_ids.push(InputMedia::Photo(
+                InputMediaPhoto::new(InputFile::file_id(id)).show_caption_above_media(true),
+            )),
             Err(e) => {
                 log::error!("Failed to get field file_id because: {}", e);
                 continue;
@@ -227,16 +269,30 @@ async fn photo_find(
 }
 
 pub fn encode(
-    session: Arc<Session>,
+    image: Arc<Session>,
+    det: Arc<Session>,
     images_bytes: Vec<u8>,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-    let processor = CLIPImageProcessor::default();
-    let pixels = processor.preprocess(images_bytes.to_vec());
+    let bb = find_bounding_box(det, &images_bytes)?;
+    let pixels = preprocess(
+        images_bytes.to_vec(),
+        224,
+        224,
+        bb,
+        if cfg!(debug_assertions) {
+            Some("data/processed.jpg")
+        } else {
+            None
+        },
+    );
 
-    let binding = pixels.into_dyn();
-    let outputs = session.run(vec![Value::from_array(session.allocator(), &binding)?])?;
+    let outputs = image.run(vec![Value::from_array(
+        image.allocator(),
+        &pixels.array.as_standard_layout().into_dyn(),
+    )?])?;
 
     let binding = outputs[0].try_extract()?;
+    log::debug!("CLIP image output: {:?}", binding);
     let embeddings = binding.view();
 
     let seq_len = embeddings.shape().get(1).unwrap();
@@ -262,7 +318,7 @@ pub fn encode_text(
     }
 
     let tokens = tokenizer.encode(text, true)?;
-    log::debug!("{:?}", tokens);
+    log::debug!("Encoded text tokens: {:?}", tokens);
 
     let outputs = session.run(vec![Value::from_array(
         session.allocator(),
@@ -270,6 +326,7 @@ pub fn encode_text(
     )?])?;
 
     let binding = outputs[0].try_extract()?;
+    log::debug!("CLIP text output: {:?}", binding);
     let embeddings = binding.view();
     let seq_len = embeddings.shape().get(1).unwrap();
 
@@ -297,4 +354,87 @@ fn get_input_ids_vector(
     let input_ids_vector =
         CowArray::from(Array2::from_shape_vec(ids_shape, input_ids_vector)?).into_dyn();
     Ok(input_ids_vector)
+}
+
+#[derive(Default, Debug)]
+pub struct BoundingBox {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    prob: f32,
+}
+
+fn find_bounding_box(
+    session: Arc<Session>,
+    images_bytes: &Vec<u8>,
+) -> Result<Option<BoundingBox>, Box<dyn Error + Send + Sync>> {
+    let yolo_input_height = session.inputs[0].dimensions[2].unwrap();
+    let yolo_input_width = session.inputs[0].dimensions[3].unwrap();
+
+    log::info!(
+        "Processing image for YOLO model. Target width: {}. Target height: {}",
+        yolo_input_width,
+        yolo_input_height,
+    );
+    let tensor = preprocess(
+        images_bytes.to_vec(),
+        yolo_input_width,
+        yolo_input_height,
+        None,
+        if cfg!(debug_assertions) {
+            Some("data/bb.jpg")
+        } else {
+            None
+        },
+    );
+
+    let outputs = session.run(vec![Value::from_array(
+        session.allocator(),
+        &tensor.array.as_standard_layout().into_dyn(),
+    )?])?;
+    let binding = outputs[0].try_extract::<f32>()?;
+    let output = binding.view();
+
+    let channels = output.shape()[1];
+    let number_of_prediction_points = output.shape()[2];
+    let reshaped = output
+        .to_shape((channels, number_of_prediction_points))
+        .unwrap();
+
+    let mut best = BoundingBox::default();
+    let horz_scale = tensor.orig_size.1 as f32 / tensor.processed_size.1 as f32;
+    let vert_scale = tensor.orig_size.0 as f32 / tensor.processed_size.0 as f32;
+    for pred in reshaped.axis_iter(ndarray::Axis(1)) {
+        let id = pred[5] as u32;
+        if id != 0 {
+            continue;
+        }
+        let person_object_confidence = pred[4];
+        if person_object_confidence > 0.25 && person_object_confidence > best.prob {
+            // bb output is in terms of the input scale, fix up to the original image size
+            // bb output bounding box is the centre point, fix up to represent top left
+            best.x =
+                ((pred[0] - tensor.padding.1 as f32 - pred[2] / 2.0) * horz_scale).round() as u32;
+            best.y =
+                ((pred[1] - tensor.padding.0 as f32 - pred[3] / 2.0) * vert_scale).round() as u32;
+            best.w = (pred[2] * horz_scale).round() as u32;
+            best.h = (pred[3] * vert_scale).round() as u32;
+            best.prob = person_object_confidence;
+            log::debug!(
+                "Found bounding box. x: {:?} y: {:?} h_scale: {} v_scale: {}",
+                pred[0],
+                pred[1],
+                horz_scale,
+                vert_scale
+            );
+        }
+    }
+
+    if best.prob > 0.25 {
+        log::info!("Final bounding box: {:?} for person", best,);
+        return Ok(Some(best));
+    } else {
+        return Ok(None);
+    }
 }

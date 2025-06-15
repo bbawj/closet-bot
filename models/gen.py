@@ -1,10 +1,12 @@
 import open_clip
 from PIL import Image
 import torch.onnx
+from ultralytics import YOLO
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cpu'
 
 # Load the model
+yolo_model = YOLO("yolo11n.pt")  # pretrained YOLO11n model
 clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B/32', force_custom_text=True)
 state_dict = torch.load("finetuned_clip.pt", map_location=device)
 state_dict = open_clip.model.convert_to_custom_text_state_dict(state_dict['CLIP'])
@@ -21,6 +23,8 @@ text_inputs = ["blue cowl neck maxi-dress", "red t-shirt", "white shirt"]
 text_inputs = [prompt + " " + t for t in text_inputs]
 
 tokenized_prompt = tokenizer(text_inputs).to(device)
+
+yolo_model.export(format="onnx")
 
 torch.onnx.export(
         clip_model.visual,
